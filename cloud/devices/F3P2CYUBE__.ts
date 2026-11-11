@@ -15,6 +15,7 @@ import { Enum } from '@/util/enum'
 //   0xEC   status frame, 92-byte body: 3B header + 45B record A (previous state) + 44B record B (current).
 //          We read record B at buf[48:]. Verified: record A is byte-identical to the previous frame's record B.
 //   0xEB   single-record status frame, 47-byte body: the same 44-byte record at buf[3:]. Seen at (re)connect.
+//   0xDE   same layout as 0xEB. Seen from the WM3850HVA (F3P2CYUBW__) when idle, before any status request.
 //   0xBD / 0xCD  full status dump / idle keepalive (~405-410 bytes) — not decoded.
 //   0x31, 0x72, 0xD8, 0xE6, 0x00  serial / heartbeat / misc — not decoded.
 //
@@ -671,7 +672,10 @@ export default class Device extends AABBDevice {
     }
 
     processAABB(buf: Buffer) {
-        this.processCommonStatus(buf, 0x20, STATUS_LENGTH, this.processStatus)
+        if (this.processCommonStatus(buf, 0x20, STATUS_LENGTH, this.processStatus)) return
+        // 0xDE: the WM3850HVA (F3P2CYUBW__, aliased here) sent its idle status as a single-record frame with
+        // the 0xEB layout under this type. Not seen from the WM4000HWA itself.
+        if (buf[0] === 0x20 && buf[1] === 0xde && buf.length === 2 + STATUS_LENGTH) this.processStatus(buf.subarray(2))
         // 0xBD/0xCD dumps, 0x31 serial, 0x72/0xD8/0xE6/0x00 heartbeats and misc are not yet decoded.
     }
 

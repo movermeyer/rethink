@@ -18,6 +18,13 @@ const EB_RECONNECT_OFF = buf(
     'aa3320eb002b0000000e0000000000000000000001000000000000000169000000003b04000000000000000000000000009ebb',
 )
 
+// 0xDE single-record frame from a WM3850HVA (F3P2CYUBW__, aliased to this decoder), idle, captured from its first
+// connection to rethink before any status request. Same layout as 0xEB: state Standby (0x01) at rec[22], Tub Clean
+// count 0x33 (51) at rec[29].
+const DE_WM3850HVA_IDLE = buf(
+    'aa3320de002b0000000e000000000000000000000000000000000001006900000000330000000000000000400000000000a4bb',
+)
+
 // Off, idle. Cycle counter 0x3B (59) persists across power-off — HA's cycle sensor read 59 all along.
 // NOTE: in standby the machine alternates frames between state 0x00 (Off, previous 0x01) and state 0x01
 // (Standby, previous 0x00) about once a minute; this fixture is one of the 0x00 frames.
@@ -166,6 +173,16 @@ describe('F3P2CYUBE__', () => {
         assert.equal(p.power, 'OFF')
         assert.equal(p.status, 'Off')
         assert.equal(p.tub_clean_count, 59)
+        assert.equal(p.remaining_time, 0)
+    })
+
+    test('0xDE single-record frames (WM3850HVA) decode like 0xEB', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', DE_WM3850HVA_IDLE)
+        const p = ha.devices[DEVICE_ID].properties
+        assert.equal(p.power, 'ON')
+        assert.equal(p.status, 'Standby')
+        assert.equal(p.tub_clean_count, 51)
         assert.equal(p.remaining_time, 0)
     })
 
