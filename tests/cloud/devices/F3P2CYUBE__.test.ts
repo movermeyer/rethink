@@ -18,6 +18,19 @@ const EB_RECONNECT_OFF = buf(
     'aa3320eb002b0000000e0000000000000000000001000000000000000169000000003b04000000000000000000000000009ebb',
 )
 
+// 0xDE single-record frame from a WM3850HVA (F3P2CYUBW__, aliased to this decoder), idle, captured from its first
+// connection to rethink before any status request. Same layout as 0xEB: state Standby (0x01) at rec[22], Tub Clean
+// count 0x33 (51) at rec[29].
+const DE_WM3850HVA_IDLE = buf(
+    'aa3320de002b0000000e000000000000000000000000000000000001006900000000330000000000000000400000000000a4bb',
+)
+
+// WM3850HVA on Normal, Pre-Wash pressed on the panel. rec[35] goes 0x00 -> 0x40: Pre-Wash alone, where the
+// WM4000HWA's Normal also carries its locked TurboWash bit (0x60). Time 65 -> 80 min.
+const NORMAL_PREWASH_WM3850HVA = buf(
+    'aa6020ec002b0003100e0f2e00000000000000004100410000000001006900000002330400000000000000000000010000002b0003100e0f2e0000000000000000500050000000000100690000000233040000000040000000000001000087bb',
+)
+
 // Off, idle. Cycle counter 0x3B (59) persists across power-off — HA's cycle sensor read 59 all along.
 // NOTE: in standby the machine alternates frames between state 0x00 (Off, previous 0x01) and state 0x01
 // (Standby, previous 0x00) about once a minute; this fixture is one of the 0x00 frames.
@@ -169,6 +182,16 @@ describe('F3P2CYUBE__', () => {
         assert.equal(p.remaining_time, 0)
     })
 
+    test('0xDE single-record frames (WM3850HVA) decode like 0xEB', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', DE_WM3850HVA_IDLE)
+        const p = ha.devices[DEVICE_ID].properties
+        assert.equal(p.power, 'ON')
+        assert.equal(p.status, 'Standby')
+        assert.equal(p.tub_clean_count, 51)
+        assert.equal(p.remaining_time, 0)
+    })
+
     test('off and idle: power OFF, timers zeroed, cycle counter retained', () => {
         const { ha, thinq } = makeDevice()
         thinq.emit('data', OFF_IDLE)
@@ -262,6 +285,20 @@ describe('F3P2CYUBE__', () => {
         assert.equal(p.cold_wash, 'OFF') // bit 0x04 clear — turbo (0x20) and cold (0x04) are independent
         thinq.emit('data', SPEED_TURBO_OFF)
         assert.equal(p.turbo_wash, 'OFF')
+    })
+
+    test('the WM3850HVA (F3P2CYUBW__) has no TurboWash entity', () => {
+        const meta: Metadata = { ...META, modelId: 'F3P2CYUBW__', modelName: 'F3P2CYUBW__' }
+        const ha = new MockHAConnection()
+        const thinq = new MockThinq2Device(DEVICE_ID, meta)
+        new DUT(ha.asConnection(), thinq, meta)
+        const dev = ha.devices[DEVICE_ID]
+        assert.equal(dev.config!.components.turbo_wash, undefined)
+        thinq.emit('data', NORMAL_PREWASH_WM3850HVA)
+        assert.equal(dev.properties.course, 'Normal')
+        assert.equal(dev.properties.pre_wash, 'ON')
+        assert.equal(dev.properties.remaining_time, 80)
+        assert.equal('turbo_wash' in dev.properties, false)
     })
 
     test('steam (rec[36] 0x10), pre-wash (rec[35] 0x40) and remote start (rec[38] 0x10)', () => {

@@ -15,6 +15,7 @@ import { Enum } from '@/util/enum'
 //   0xEC   status frame, 92-byte body: 3B header + 45B record A (previous state) + 44B record B (current).
 //          We read record B at buf[48:]. Verified: record A is byte-identical to the previous frame's record B.
 //   0xEB   single-record status frame, 47-byte body: the same 44-byte record at buf[3:]. Seen at (re)connect.
+//   0xDE   same layout as 0xEB. Seen from the WM3850HVA (F3P2CYUBW__) when idle, before any status request.
 //   0xBD / 0xCD  full status dump / idle keepalive (~405-410 bytes) — not decoded.
 //   0x31, 0x72, 0xD8, 0xE6, 0x00  serial / heartbeat / misc — not decoded.
 //
@@ -42,7 +43,7 @@ import { Enum } from '@/util/enum'
 //   rec[37]  bit 0x40 FreshCare
 //   rec[38]  bit 0x10 remote start (drives the annunciator lamp), 0x20 child lock, 0x40 panel-activity timer (see
 //            below; LG calls it doorClose but it is not the door), 0x80 Add Item (addGarment)
-//   rec[41]  bit 0x01 AI DD badge (AIDDLed) — course-linked (on for Normal & Bright Whites)
+//   rec[41]  bit 0x01 AI DD badge (AIDDLed) — on for Normal & Bright Whites, and off at Heavy soil
 //
 // Examined and left unmapped (not user-facing features): rec[21] single-frame transient; rec[25] phase-progress
 // sub-byte, redundant with state. rec[38] 0x40 (LG's doorClose) is NOT the door: against a contact sensor on an HBA
@@ -86,6 +87,10 @@ const OPT35_COLD_WASH = 0x04
 // explains the Normal lock — on Normal this bit is permanently set (Turbo can't be turned off), so the
 // sibling's "Turbo reads ON and can't be cycled on Normal" is the same effect, one byte over.
 const OPT35_TURBO_WASH = 0x20
+// Models aliased to this decoder whose panel has no TurboWash button. On a WM3850HVA (F3P2CYUBW__) rec[35] 0x20
+// stayed clear on all 12 dial courses (Normal included, which locks it on for the WM4000HWA), so the entity is
+// left out there rather than reading a permanent OFF.
+const NO_TURBO_WASH_MODELS = new Set(['F3P2CYUBW__'])
 const OPT35_PRE_WASH = 0x40 // pinned live: rec[35] 0x20->0x60 with cloud preWash ON
 // rec[36] bit 0x10 = steam, bit 0x20 = Rinse+Spin subcycle (temp/soil null while active). rec[37] bit 0x40 = FreshCare.
 // rec[38] bit 0x10 = REMOTE START (LG's remoteStart field): ON while the machine is running or armed to run
@@ -109,8 +114,9 @@ const OPT38_ADD_ITEM = 0x80 // Add Item annunciator (LG's addGarment). CONFIRMED
 // episode (which pauses, drains, and unlocks); a PLAIN pause clears remote_start WITHOUT setting this bit, which is
 // what distinguishes it. Cleared on resume.
 const AIDDLED_OFFSET = 41
-const AIDDLED_BIT = 0x01 // AI DD fabric-sensing badge (LG's AIDDLed). Purely a function of the selected course (on
-// for Normal & Bright Whites, off for all others) — the cloud reports it, so we mirror it.
+const AIDDLED_BIT = 0x01 // AI DD fabric-sensing badge (LG's AIDDLed). Set by the selected course (on for Normal &
+// Bright Whites, off for all others) and by the soil level: on a WM3850HVA (F3P2CYUBW__) it went off when Soil was
+// stepped to Heavy on Normal and came back on at Light. The cloud reports it, so we mirror it.
 
 const STATE_OFF = 0x00
 
@@ -349,8 +355,11 @@ const SPECIALTY_DOWNLOAD: Record<string, string> = Object.fromEntries(
 const SPECIALTY_OPTIONS = ['unknown', ...SPECIALTY_COURSES.map((c) => c.name)]
 
 export default class Device extends AABBDevice {
+    private readonly hasTurboWash: boolean
+
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq, true)
+        this.hasTurboWash = !NO_TURBO_WASH_MODELS.has(meta.modelId)
         this.setConfig(
             allowExtendedType({
                 ...HADevice.config(meta, { name: 'LG Washer' }),
@@ -487,13 +496,17 @@ export default class Device extends AABBDevice {
                         name: 'Cold wash',
                         icon: 'mdi:snowflake',
                     },
-                    turbo_wash: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-turbo_wash',
-                        state_topic: '$this/turbo_wash',
-                        name: 'TurboWash',
-                        icon: 'mdi:rocket-launch',
-                    },
+                    ...(this.hasTurboWash
+                        ? {
+                              turbo_wash: {
+                                  platform: 'binary_sensor',
+                                  unique_id: '$deviceid-turbo_wash',
+                                  state_topic: '$this/turbo_wash',
+                                  name: 'TurboWash',
+                                  icon: 'mdi:rocket-launch',
+                              },
+                          }
+                        : {}),
                     pre_wash: {
                         platform: 'binary_sensor',
                         unique_id: '$deviceid-pre_wash',
@@ -671,7 +684,10 @@ export default class Device extends AABBDevice {
     }
 
     processAABB(buf: Buffer) {
-        this.processCommonStatus(buf, 0x20, STATUS_LENGTH, this.processStatus)
+        if (this.processCommonStatus(buf, 0x20, STATUS_LENGTH, this.processStatus)) return
+        // 0xDE: the WM3850HVA (F3P2CYUBW__, aliased here) sent its idle status as a single-record frame with
+        // the 0xEB layout under this type. Not seen from the WM4000HWA itself.
+        if (buf[0] === 0x20 && buf[1] === 0xde && buf.length === 2 + STATUS_LENGTH) this.processStatus(buf.subarray(2))
         // 0xBD/0xCD dumps, 0x31 serial, 0x72/0xD8/0xE6/0x00 heartbeats and misc are not yet decoded.
     }
 
@@ -713,7 +729,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('extra_rinse', extraRinses > 0 ? 'ON' : 'OFF')
         this.publishProperty('extra_rinse_count', extraRinses)
         this.publishProperty('cold_wash', (rec[OPTS35_OFFSET] & OPT35_COLD_WASH) !== 0 ? 'ON' : 'OFF')
-        this.publishProperty('turbo_wash', (rec[OPTS35_OFFSET] & OPT35_TURBO_WASH) !== 0 ? 'ON' : 'OFF')
+        if (this.hasTurboWash)
+            this.publishProperty('turbo_wash', (rec[OPTS35_OFFSET] & OPT35_TURBO_WASH) !== 0 ? 'ON' : 'OFF')
         this.publishProperty('pre_wash', (rec[OPTS35_OFFSET] & OPT35_PRE_WASH) !== 0 ? 'ON' : 'OFF')
         this.publishProperty('steam', (rec[OPTS36_OFFSET] & OPT36_STEAM) !== 0 ? 'ON' : 'OFF')
         this.publishProperty('rinse_spin', (rec[OPTS36_OFFSET] & OPT36_RINSE_SPIN) !== 0 ? 'ON' : 'OFF')
@@ -726,7 +743,7 @@ export default class Device extends AABBDevice {
         // "open" long after the door is shut, untouched). LG monitors doorClose but its app shows no door tile, same
         // reason. The physical door LOCK is not in-frame.
         this.publishProperty('add_item', (rec[OPTS38_OFFSET] & OPT38_ADD_ITEM) !== 0 ? 'ON' : 'OFF')
-        // AI DD badge (LG's AIDDLed): course-linked, mirrored from the cloud (see AIDDLED_OFFSET).
+        // AI DD badge (LG's AIDDLed): set by the course and the soil level, mirrored from the cloud (see AIDDLED_BIT).
         this.publishProperty('ai_dd', (rec[AIDDLED_OFFSET] & AIDDLED_BIT) !== 0 ? 'ON' : 'OFF')
         this.publishProperty('spin', SPIN.map(rec[SPIN_OFFSET]))
         this.publishProperty('tub_clean_count', rec[TUB_CLEAN_COUNT_OFFSET])
