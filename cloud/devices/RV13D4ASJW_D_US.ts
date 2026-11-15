@@ -37,6 +37,10 @@ const STATUS_LENGTH = 29
 // so this only ever reads. Confirmed on a live RV13B6ES: the dryer answered within a second
 // with a 0xEB snapshot, then resumed normal 0xEC updates.
 const STATUS_REQUEST = 'F0ED1121010000001800'
+// After a remote command the dryer acks it at once (`30 00 <opcode>`) but only reports the state it leads to with
+// a later frame of its own: 2..16 s for Start/Resume and ~15 s for Pause on a DLEX3850V (2026-11-15), where a
+// panel press is reported within a second. Asking for the status a few times after each command closes that gap.
+const FOLLOW_UP_POLLS_MS = [1000, 3000, 6000, 10000]
 
 // Offsets below are relative to the record's own 0x1b marker (rec[0]).
 const PHASE_OFFSET = 1
@@ -281,6 +285,8 @@ const MORE_LESS_MAX = 60
 export default class Device extends AABBDevice {
     // The last status record, for commands built off what the panel has set.
     private lastRecord: Buffer | null = null
+    // Pending status requests after the last remote command.
+    private followUps: ReturnType<typeof setTimeout>[] = []
 
     // Staged remote-start options, assembled into one start packet by start_course.
     private targetCourse = 'Normal'
@@ -656,13 +662,35 @@ export default class Device extends AABBDevice {
         this.send(Buffer.from(STATUS_REQUEST, 'hex'))
     }
 
+    drop() {
+        this.cancelFollowUps()
+        super.drop()
+    }
+
+    // Sends a command, then asks for the status a few times so the state it leads to shows up without waiting
+    // for the dryer to volunteer it. A newer command restarts the schedule.
+    private command(pkt: Buffer) {
+        this.send(pkt)
+        this.cancelFollowUps()
+        this.followUps = FOLLOW_UP_POLLS_MS.map((ms) => {
+            const t = setTimeout(() => this.send(Buffer.from(STATUS_REQUEST, 'hex')), ms)
+            t.unref?.()
+            return t
+        })
+    }
+
+    private cancelFollowUps() {
+        for (const t of this.followUps) clearTimeout(t)
+        this.followUps = []
+    }
+
     // The appliance is the interlock and the only one: Remote Start must be armed at the panel and cannot be
     // armed remotely; an unarmed start is simply ignored (the dryer beeps). Nothing here re-checks that.
     setProperty(prop: string, value: string) {
         if (prop === 'pause') {
-            if (value === 'PRESS') this.send(Buffer.from(CMD_PAUSE))
+            if (value === 'PRESS') this.command(Buffer.from(CMD_PAUSE))
         } else if (prop === 'power_off') {
-            if (value === 'PRESS') this.send(Buffer.from(CMD_POWER_OFF))
+            if (value === 'PRESS') this.command(Buffer.from(CMD_POWER_OFF))
         } else if (prop === 'start') {
             const rec = this.lastRecord
             if (value !== 'PRESS' || !rec) return
@@ -671,7 +699,7 @@ export default class Device extends AABBDevice {
                 START_OPTS_BASE |
                 (rec[PHASE_OFFSET] === PHASE_PAUSED ? 0 : START_OPTS_NEW_CYCLE) |
                 ((rec[OPT2_OFFSET] & OPT2_ENERGY_SAVER) !== 0 ? START_OPTS_ENERGY_SAVER : 0)
-            this.send(this.startPacketFromRecord(rec, rec[FLAGS_OFFSET] & ~FLAG_PANEL_ACTIVE & 0xff, opts))
+            this.command(this.startPacketFromRecord(rec, rec[FLAGS_OFFSET] & ~FLAG_PANEL_ACTIVE & 0xff, opts))
         } else if (prop === 'wrinkle_care') {
             const rec = this.lastRecord
             if (!rec) return
@@ -683,7 +711,7 @@ export default class Device extends AABBDevice {
             const flags =
                 (rec[FLAGS_OFFSET] & ~FLAG_PANEL_ACTIVE & ~FLAG_WRINKLE_CARE & 0xff) |
                 (value === 'ON' ? FLAG_WRINKLE_CARE : 0)
-            this.send(
+            this.command(
                 this.startPacketFromRecord(
                     rec,
                     flags,
@@ -693,7 +721,7 @@ export default class Device extends AABBDevice {
         } else if (prop === 'specialty') {
             const dl = SPECIALTY_DOWNLOAD[value]
             if (dl === undefined) return
-            this.send(Buffer.from(dl, 'hex'))
+            this.command(Buffer.from(dl, 'hex'))
             this.publishProperty('specialty', 'unknown')
         } else if (prop === 'target_course') {
             if (!TARGET_COURSES.includes(value)) return
@@ -731,7 +759,7 @@ export default class Device extends AABBDevice {
         } else if (prop === 'start_course') {
             if (value !== 'PRESS') return
             const pkt = this.buildCourseStart()
-            if (pkt) this.send(pkt)
+            if (pkt) this.command(pkt)
         }
     }
 

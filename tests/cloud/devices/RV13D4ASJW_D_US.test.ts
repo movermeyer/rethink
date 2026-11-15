@@ -1,4 +1,4 @@
-import { describe, test } from 'node:test'
+import { describe, mock, test } from 'node:test'
 import assert from 'node:assert/strict'
 import DUT from '@/cloud/devices/RV13D4ASJW_D_US'
 import type { Metadata } from '@/cloud/thinq'
@@ -318,6 +318,33 @@ describe('RV13D4ASJW_D_US', () => {
             thinq.outbox.map((b) => b.toString('hex')),
             ['aa09f02404010099bb', 'aa09f0240101009cbb'],
         )
+    })
+    test('each command is followed by status requests at 1, 3, 6 and 10 s, restarted by the next one', () => {
+        mock.timers.enable({ apis: ['setTimeout'] })
+        try {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', DRYING)
+            const sent = () => thinq.outbox.map((b) => (b.toString('hex').includes('f0ed1121') ? 'status' : 'cmd'))
+            dev.setProperty('pause', 'PRESS')
+            assert.deepEqual(sent(), ['cmd'])
+            mock.timers.tick(1000)
+            assert.deepEqual(sent(), ['cmd', 'status'])
+            mock.timers.tick(2000)
+            assert.deepEqual(sent(), ['cmd', 'status', 'status'])
+            // a new command drops the rest of the first schedule and starts its own
+            dev.setProperty('power_off', 'PRESS')
+            mock.timers.tick(10000)
+            assert.deepEqual(sent(), ['cmd', 'status', 'status', 'cmd', 'status', 'status', 'status', 'status'])
+            mock.timers.tick(60000)
+            assert.equal(sent().length, 8)
+            // dropping the device cancels a pending schedule
+            dev.setProperty('pause', 'PRESS')
+            dev.drop()
+            mock.timers.tick(60000)
+            assert.equal(sent().length, 9)
+        } finally {
+            mock.timers.reset()
+        }
     })
     test('downloaded course reads back from rec[24]', () => {
         assert.equal(feed([DOWNLOADED_SUPER_DRY]).downloaded_course, 'Super Dry')
